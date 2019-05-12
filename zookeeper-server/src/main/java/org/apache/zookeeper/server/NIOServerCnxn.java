@@ -19,7 +19,6 @@
 package org.apache.zookeeper.server;
 
 import java.io.BufferedWriter;
-import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.PrintWriter;
 import java.io.Writer;
@@ -36,10 +35,10 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import org.apache.jute.BinaryInputArchive;
-import org.apache.jute.BinaryOutputArchive;
 import org.apache.jute.Record;
 import org.apache.zookeeper.WatchedEvent;
 import org.apache.zookeeper.data.Id;
+import org.apache.zookeeper.data.Stat;
 import org.apache.zookeeper.proto.ReplyHeader;
 import org.apache.zookeeper.proto.RequestHeader;
 import org.apache.zookeeper.proto.WatcherEvent;
@@ -77,36 +76,22 @@ public class NIOServerCnxn extends ServerCnxn {
 
     private int sessionTimeout;
 
-    private final ZooKeeperServer zkServer;
-
-    /**
-     * The number of requests that have been submitted but not yet responded to.
-     */
-    private final AtomicInteger outstandingRequests = new AtomicInteger(0);
-
     /**
      * This is the id that uniquely identifies the session of a client. Once
      * this session is no longer active, the ephemeral nodes will go away.
      */
     private long sessionId;
 
-    private final int outstandingLimit;
-
     public NIOServerCnxn(ZooKeeperServer zk, SocketChannel sock,
                          SelectionKey sk, NIOServerCnxnFactory factory,
                          SelectorThread selectorThread) throws IOException {
-        this.zkServer = zk;
+        super(zk);
         this.sock = sock;
         this.sk = sk;
         this.factory = factory;
         this.selectorThread = selectorThread;
         if (this.factory.login != null) {
             this.zooKeeperSaslServer = new ZooKeeperSaslServer(factory.login);
-        }
-        if (zk != null) {
-            outstandingLimit = zk.getGlobalOutstandingLimit();
-        } else {
-            outstandingLimit = 1;
         }
         sock.socket().setTcpNoDelay(true);
         /* set socket linger to false, so that socket close does not block */
@@ -151,20 +136,26 @@ public class NIOServerCnxn extends ServerCnxn {
      * sendBuffer pushes a byte buffer onto the outgoing buffer queue for
      * asynchronous writes.
      */
-    public void sendBuffer(ByteBuffer bb) {
+    public void sendBuffer(ByteBuffer... buffers) {
         if (LOG.isTraceEnabled()) {
             LOG.trace("Add a buffer to outgoingBuffers, sk " + sk
                       + " is valid: " + sk.isValid());
         }
-        outgoingBuffers.add(bb);
+        synchronized (outgoingBuffers) {
+            for (ByteBuffer buffer : buffers) {
+                outgoingBuffers.add(buffer);
+            }
+            outgoingBuffers.add(packetSentinel);
+        }
         requestInterestOpsUpdate();
     }
 
     /** Read the request payload (everything following the length prefix) */
-    private void readPayload() throws IOException, InterruptedException {
+    private void readPayload() throws IOException, InterruptedException, ClientCnxnLimitException {
         if (incomingBuffer.remaining() != 0) { // have we read length bytes?
             int rc = sock.read(incomingBuffer); // sock is non-blocking, so ok
             if (rc < 0) {
+                ServerMetrics.getMetrics().CONNECTION_DROP_COUNT.add(1);
                 throw new EndOfStreamException(
                         "Unable to read additional data from client sessionid 0x"
                         + Long.toHexString(sessionId)
@@ -235,10 +226,12 @@ public class NIOServerCnxn extends ServerCnxn {
                 if (bb == ServerCnxnFactory.closeConn) {
                     throw new CloseRequestException("close requested");
                 }
+                if (bb == packetSentinel) {
+                    packetSent();
+                }
                 if (bb.remaining() > 0) {
                     break;
                 }
-                packetSent();
                 outgoingBuffers.remove();
             }
          } else {
@@ -283,6 +276,9 @@ public class NIOServerCnxn extends ServerCnxn {
                 if (bb == ServerCnxnFactory.closeConn) {
                     throw new CloseRequestException("close requested");
                 }
+                if (bb == packetSentinel) {
+                    packetSent();
+                }
                 if (sent < bb.remaining()) {
                     /*
                      * We only partially sent this buffer, so we update
@@ -291,7 +287,6 @@ public class NIOServerCnxn extends ServerCnxn {
                     bb.position(bb.position() + sent);
                     break;
                 }
-                packetSent();
                 /* We've sent the whole buffer, so drop the buffer */
                 sent -= bb.remaining();
                 outgoingBuffers.remove();
@@ -320,6 +315,7 @@ public class NIOServerCnxn extends ServerCnxn {
             if (k.isReadable()) {
                 int rc = sock.read(incomingBuffer);
                 if (rc < 0) {
+                    ServerMetrics.getMetrics().CONNECTION_DROP_COUNT.add(1);
                     throw new EndOfStreamException(
                             "Unable to read additional data from client sessionid 0x"
                             + Long.toHexString(sessionId)
@@ -366,6 +362,14 @@ public class NIOServerCnxn extends ServerCnxn {
             LOG.warn(e.getMessage());
             // expecting close to log session closure
             close();
+        } catch (ClientCnxnLimitException e) {
+            // Common case exception, print at debug level
+            ServerMetrics.getMetrics().CONNECTION_REJECTED.add(1);
+            if (LOG.isDebugEnabled()) {
+                LOG.debug("Exception causing close of session 0x"
+                          + Long.toHexString(sessionId) + ": " + e.getMessage());
+            }
+            close();
         } catch (IOException e) {
             LOG.warn("Exception causing close of session 0x"
                      + Long.toHexString(sessionId) + ": " + e.getMessage());
@@ -378,21 +382,6 @@ public class NIOServerCnxn extends ServerCnxn {
 
     private void readRequest() throws IOException {
         zkServer.processPacket(this, incomingBuffer);
-    }
-
-    // Only called as callback from zkServer.processPacket()
-    protected void incrOutstandingRequests(RequestHeader h) {
-        if (h.getXid() >= 0) {
-            outstandingRequests.incrementAndGet();
-            // check throttling
-            int inProcess = zkServer.getInProcess();
-            if (inProcess > outstandingLimit) {
-                if (LOG.isDebugEnabled()) {
-                    LOG.debug("Throttling recv " + inProcess);
-                }
-                disableRecv();
-            }
-        }
     }
 
     // returns whether we are interested in writing, which is determined
@@ -411,7 +400,9 @@ public class NIOServerCnxn extends ServerCnxn {
 
     // Throttle acceptance of new requests. If this entailed a state change,
     // register an interest op update request with the selector.
-    public void disableRecv() {
+    //
+    // Don't support wait disable receive in NIO, ignore the parameter
+    public void disableRecv(boolean waitDisableRecv) {
         if (throttled.compareAndSet(false, true)) {
             requestInterestOpsUpdate();
         }
@@ -426,7 +417,7 @@ public class NIOServerCnxn extends ServerCnxn {
         }
     }
 
-    private void readConnectRequest() throws IOException, InterruptedException {
+    private void readConnectRequest() throws IOException, InterruptedException, ClientCnxnLimitException {
         if (!isZKServerRunning()) {
             throw new IOException("ZooKeeperServer not running");
         }
@@ -566,10 +557,6 @@ public class NIOServerCnxn extends ServerCnxn {
         return zkServer != null && zkServer.isRunning();
     }
 
-    public long getOutstandingRequests() {
-        return outstandingRequests.get();
-    }
-
     /*
      * (non-Javadoc)
      *
@@ -679,23 +666,35 @@ public class NIOServerCnxn extends ServerCnxn {
         }
     }
 
-    /*
-     * (non-Javadoc)
+    private final static ByteBuffer packetSentinel = ByteBuffer.allocate(0);
+
+    /**
+     * Serializes a ZooKeeper response and enqueues it for sending.
      *
-     * @see org.apache.zookeeper.server.ServerCnxnIface#sendResponse(org.apache.zookeeper.proto.ReplyHeader,
-     *      org.apache.jute.Record, java.lang.String)
+     * Serializes client response parts and enqueues them into outgoing queue.
+     *
+     * If both cache key and last modified zxid are provided, the serialized
+     * response is caсhed under the provided key, the last modified zxid is
+     * stored along with the value. A cache entry is invalidated if the
+     * provided last modified zxid is more recent than the stored one.
+     *
+     * Attention: this function is not thread safe, due to caching not being
+     * thread safe.
+     *
+     * @param h reply header
+     * @param r reply payload, can be null
+     * @param tag Jute serialization tag, can be null
+     * @param cacheKey key for caching the serialized payload. a null value
+     *     prvents caching
+     * @param stat stat information for the the reply payload, used
+     *     for cache invalidation. a value of 0 prevents caching.
      */
     @Override
-    public void sendResponse(ReplyHeader h, Record r, String tag) {
+    public void sendResponse(ReplyHeader h, Record r, String tag,
+                             String cacheKey, Stat stat) {
         try {
-            super.sendResponse(h, r, tag);
-            if (h.getXid() > 0) {
-                // check throttling
-                if (outstandingRequests.decrementAndGet() < 1 ||
-                    zkServer.getInProcess() < outstandingLimit) {
-                    enableRecv();
-                }
-            }
+            sendBuffer(serialize(h, r, tag, cacheKey, stat));
+            decrOutstandingAndCheckThrottle(h);
          } catch(Exception e) {
             LOG.warn("Unexpected exception. Destruction averted.", e);
          }
@@ -719,7 +718,7 @@ public class NIOServerCnxn extends ServerCnxn {
         // Convert WatchedEvent to a type that can be sent over the wire
         WatcherEvent e = event.getWrapper();
 
-        sendResponse(h, e, "notification");
+        sendResponse(h, e, "notification", null, null);
     }
 
     /*

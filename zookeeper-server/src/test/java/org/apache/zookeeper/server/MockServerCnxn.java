@@ -24,10 +24,15 @@ import java.security.cert.Certificate;
 import org.apache.jute.Record;
 import org.apache.zookeeper.WatchedEvent;
 import org.apache.zookeeper.proto.ReplyHeader;
+import org.apache.zookeeper.data.Stat;
 
 public class MockServerCnxn extends ServerCnxn {
     public Certificate[] clientChain;
     public boolean secure;
+
+    public MockServerCnxn() {
+        super(null);
+    }
 
     @Override
     int getSessionTimeout() {
@@ -35,11 +40,11 @@ public class MockServerCnxn extends ServerCnxn {
     }
 
     @Override
-    void close() {
+    public void close() {
     }
 
     @Override
-    public void sendResponse(ReplyHeader h, Record r, String tag)
+    public void sendResponse(ReplyHeader h, Record r, String tag, String cacheKey, Stat stat)
             throws IOException {
     }
 
@@ -76,7 +81,7 @@ public class MockServerCnxn extends ServerCnxn {
     }
 
     @Override
-    void sendBuffer(ByteBuffer closeConn) {
+    void sendBuffer(ByteBuffer... closeConn) {
     }
 
     @Override
@@ -84,7 +89,7 @@ public class MockServerCnxn extends ServerCnxn {
     }
 
     @Override
-    void disableRecv() {
+    void disableRecv(boolean waitDisableRecv) {
     }
 
     @Override

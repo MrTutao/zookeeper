@@ -30,6 +30,7 @@ import org.apache.zookeeper.server.ServerCnxn;
 import org.apache.zookeeper.server.ZKDatabase;
 import org.apache.zookeeper.server.persistence.FileTxnSnapLog;
 
+import javax.management.JMException;
 import java.io.IOException;
 import java.util.concurrent.TimeUnit;
 
@@ -54,7 +55,8 @@ public class LeaderZooKeeperServer extends QuorumZooKeeperServer {
      * @throws IOException
      */
     LeaderZooKeeperServer(FileTxnSnapLog logFactory, QuorumPeer self, ZKDatabase zkDb) throws IOException {
-        super(logFactory, self.tickTime, self.minSessionTimeout, self.maxSessionTimeout, zkDb, self);
+        super(logFactory, self.tickTime, self.minSessionTimeout, self.maxSessionTimeout,
+                self.clientPortListenBacklog, zkDb, self);
     }
 
     public Leader getLeader(){
@@ -105,7 +107,9 @@ public class LeaderZooKeeperServer extends QuorumZooKeeperServer {
     @Override
     public int getGlobalOutstandingLimit() {
         int divisor = self.getQuorumSize() > 2 ? self.getQuorumSize() - 1 : 1;
-        return super.getGlobalOutstandingLimit() / divisor;
+        int globalOutstandingLimit = super.getGlobalOutstandingLimit() / divisor;
+        LOG.info("Override {} to {}", GLOBAL_OUTSTANDING_LIMIT, globalOutstandingLimit);
+        return globalOutstandingLimit;
     }
 
     @Override
@@ -182,6 +186,16 @@ public class LeaderZooKeeperServer extends QuorumZooKeeperServer {
             LOG.warn("Failed to register with JMX", e);
             jmxServerBean = null;
         }
+    }
+
+    boolean registerJMX(LearnerHandlerBean handlerBean) {
+        try {
+            MBeanRegistry.getInstance().register(handlerBean, jmxServerBean);
+            return true;
+        } catch (JMException e) {
+            LOG.warn("Could not register connection", e);
+        }
+        return false;
     }
 
     @Override

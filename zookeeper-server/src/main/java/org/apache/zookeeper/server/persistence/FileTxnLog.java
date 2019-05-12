@@ -29,9 +29,10 @@ import java.io.InputStream;
 import java.io.RandomAccessFile;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
-import java.util.LinkedList;
 import java.util.List;
+import java.util.Queue;
 import java.util.concurrent.TimeUnit;
 import java.util.zip.Adler32;
 import java.util.zip.Checksum;
@@ -106,6 +107,21 @@ public class FileTxnLog implements TxnLog {
     /** Maximum time we allow for elapsed fsync before WARNing */
     private final static long fsyncWarningThresholdMS;
 
+    /**
+     * This parameter limit the size of each txnlog to a given limit (KB).
+     * It does not affect how often the system will take a snapshot [zookeeper.snapCount]
+     * We roll the txnlog when either of the two limits are reached.
+     * Also since we only roll the logs at transaction boundaries, actual file size can exceed
+     * this limit by the maximum size of a serialized transaction.
+     * The feature is disabled by default (-1)
+     */
+    private static final String txnLogSizeLimitSetting = "zookeeper.txnLogSizeLimitInKb";
+
+    /**
+     * The actual txnlog size limit in bytes.
+     */
+    private static long txnLogSizeLimit = -1;
+
     static {
         LOG = LoggerFactory.getLogger(FileTxnLog.class);
 
@@ -114,6 +130,15 @@ public class FileTxnLog implements TxnLog {
         if ((fsyncWarningThreshold = Long.getLong(ZOOKEEPER_FSYNC_WARNING_THRESHOLD_MS_PROPERTY)) == null)
             fsyncWarningThreshold = Long.getLong(FSYNC_WARNING_THRESHOLD_MS_PROPERTY, 1000);
         fsyncWarningThresholdMS = fsyncWarningThreshold;
+
+        Long logSize = Long.getLong(txnLogSizeLimitSetting, -1);
+        if (logSize > 0) {
+            LOG.info("{} = {}", txnLogSizeLimitSetting, logSize);
+
+            // Convert to bytes
+            logSize = logSize * 1024;
+            txnLogSizeLimit = logSize;
+        }
     }
 
     long lastZxidSeen;
@@ -124,8 +149,7 @@ public class FileTxnLog implements TxnLog {
     File logDir;
     private final boolean forceSync = !System.getProperty("zookeeper.forceSync", "yes").equals("no");
     long dbId;
-    private LinkedList<FileOutputStream> streamsToFlush =
-        new LinkedList<FileOutputStream>();
+    private final Queue<FileOutputStream> streamsToFlush = new ArrayDeque<>();
     File logFileWrite = null;
     private FilePadding filePadding = new FilePadding();
 
@@ -156,8 +180,26 @@ public class FileTxnLog implements TxnLog {
      * @param serverStats used to update fsyncThresholdExceedCount
      */
     @Override
-    public void setServerStats(ServerStats serverStats) {
+    public synchronized void setServerStats(ServerStats serverStats) {
         this.serverStats = serverStats;
+    }
+
+    /**
+     * Set log size limit
+     */
+    public static void setTxnLogSizeLimit(long size) {
+        txnLogSizeLimit = size;
+    }
+
+    /**
+     * Return the current on-disk size of log size. This will be accurate only
+     * after commit() is called. Otherwise, unflushed txns may not be included.
+     */
+    public synchronized long getCurrentLogSize() {
+        if (logFileWrite != null) {
+            return logFileWrite.length();
+        }
+        return 0;
     }
 
     /**
@@ -346,11 +388,22 @@ public class FileTxnLog implements TxnLog {
                             + "File size is " + channel.size() + " bytes. "
                             + "See the ZooKeeper troubleshooting guide");
                 }
-                ServerMetrics.FSYNC_TIME.add(syncElapsedMS);
+                
+                ServerMetrics.getMetrics().FSYNC_TIME.add(syncElapsedMS);
             }
         }
         while (streamsToFlush.size() > 1) {
-            streamsToFlush.removeFirst().close();
+            streamsToFlush.poll().close();
+        }
+
+        // Roll the log file if we exceed the size limit
+        if(txnLogSizeLimit > 0) {
+            long logSize = getCurrentLogSize();
+
+            if (logSize > txnLogSizeLimit) {
+                LOG.debug("Log size limit reached: {}", logSize);
+                rollLog();
+            }
         }
     }
 

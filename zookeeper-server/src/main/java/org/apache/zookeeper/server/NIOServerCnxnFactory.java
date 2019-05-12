@@ -310,6 +310,7 @@ public class NIOServerCnxnFactory extends ServerCnxnFactory {
                 acceptErrorLogger.flush();
             } catch (IOException e) {
                 // accept, maxClientCnxns, configureBlocking
+                ServerMetrics.getMetrics().CONNECTION_REJECTED.add(1);
                 acceptErrorLogger.rateLimitLog(
                     "Error accepting new connection: " + e.getMessage());
                 fastCloseSock(sc);
@@ -575,6 +576,7 @@ public class NIOServerCnxnFactory extends ServerCnxnFactory {
                         continue;
                     }
                     for (NIOServerCnxn conn : cnxnExpiryQueue.poll()) {
+                        ServerMetrics.getMetrics().SESSIONLESS_CONNECTIONS_EXPIRED.add(1);
                         conn.close();
                     }
                 }
@@ -604,14 +606,12 @@ public class NIOServerCnxnFactory extends ServerCnxnFactory {
         return directBufferBytes > 0 ? directBuffer.get() : null;
     }
 
-    // sessionMap is used by closeSession()
-    private final ConcurrentHashMap<Long, NIOServerCnxn> sessionMap =
-        new ConcurrentHashMap<Long, NIOServerCnxn>();
     // ipMap is used to limit connections per IP
     private final ConcurrentHashMap<InetAddress, Set<NIOServerCnxn>> ipMap =
         new ConcurrentHashMap<InetAddress, Set<NIOServerCnxn>>( );
 
     protected int maxClientCnxns = 60;
+    int listenBacklog = -1;
 
     int sessionlessCnxnTimeout;
     private ExpiryQueue<NIOServerCnxn> cnxnExpiryQueue;
@@ -639,7 +639,7 @@ public class NIOServerCnxnFactory extends ServerCnxnFactory {
         new HashSet<SelectorThread>();
 
     @Override
-    public void configure(InetSocketAddress addr, int maxcc, boolean secure) throws IOException {
+    public void configure(InetSocketAddress addr, int maxcc, int backlog, boolean secure) throws IOException {
         if (secure) {
             throw new UnsupportedOperationException("SSL isn't supported in NIOServerCnxn");
         }
@@ -681,10 +681,15 @@ public class NIOServerCnxnFactory extends ServerCnxnFactory {
             selectorThreads.add(new SelectorThread(i));
         }
 
+        listenBacklog = backlog;
         this.ss = ServerSocketChannel.open();
         ss.socket().setReuseAddress(true);
         LOG.info("binding to port " + addr);
-        ss.socket().bind(addr);
+        if (listenBacklog == -1) {
+          ss.socket().bind(addr);
+        } else {
+          ss.socket().bind(addr, listenBacklog);
+        }
         ss.configureBlocking(false);
         acceptThread = new AcceptThread(ss, addr, selectorThreads);
     }
@@ -701,11 +706,6 @@ public class NIOServerCnxnFactory extends ServerCnxnFactory {
     public void reconfigure(InetSocketAddress addr) {
         ServerSocketChannel oldSS = ss;        
         try {
-            this.ss = ServerSocketChannel.open();
-            ss.socket().setReuseAddress(true);
-            LOG.info("binding to port " + addr);
-            ss.socket().bind(addr);
-            ss.configureBlocking(false);
             acceptThread.setReconfiguring();
             tryClose(oldSS);
             acceptThread.wakeupSelector();
@@ -716,6 +716,11 @@ public class NIOServerCnxnFactory extends ServerCnxnFactory {
                             e.getMessage());
                 Thread.currentThread().interrupt();
             }
+            this.ss = ServerSocketChannel.open();
+            ss.socket().setReuseAddress(true);
+            LOG.info("binding to port " + addr);
+            ss.socket().bind(addr);
+            ss.configureBlocking(false);
             acceptThread = new AcceptThread(ss, addr, selectorThreads);
             acceptThread.start();
         } catch(IOException e) {
@@ -732,6 +737,11 @@ public class NIOServerCnxnFactory extends ServerCnxnFactory {
     /** {@inheritDoc} */
     public void setMaxClientCnxnsPerHost(int max) {
         maxClientCnxns = max;
+    }
+
+    /** {@inheritDoc} */
+    public int getSocketListenBacklog() {
+        return listenBacklog;
     }
 
     @Override
@@ -787,10 +797,7 @@ public class NIOServerCnxnFactory extends ServerCnxnFactory {
         }
         cnxnExpiryQueue.remove(cnxn);
 
-        long sessionId = cnxn.getSessionId();
-        if (sessionId != 0) {
-            sessionMap.remove(sessionId);
-        }
+        removeCnxnFromSessionMap(cnxn);
 
         InetAddress addr = cnxn.getSocketAddress();
         if (addr != null) {
@@ -884,13 +891,21 @@ public class NIOServerCnxnFactory extends ServerCnxnFactory {
         }
 
         if (acceptThread != null) {
-            acceptThread.wakeupSelector();
+            if (acceptThread.isAlive()) {
+                acceptThread.wakeupSelector();
+            } else {
+                acceptThread.closeSelector();
+            }
         }
         if (expirerThread != null) {
             expirerThread.interrupt();
         }
         for (SelectorThread thread : selectorThreads) {
-            thread.wakeupSelector();
+            if (thread.isAlive()) {
+                thread.wakeupSelector();
+            } else {
+                thread.closeSelector();
+            }
         }
         if (workerPool != null) {
             workerPool.stop();
@@ -920,20 +935,6 @@ public class NIOServerCnxnFactory extends ServerCnxnFactory {
         if (zkServer != null) {
             zkServer.shutdown();
         }
-    }
-
-    public void addSession(long sessionId, NIOServerCnxn cnxn) {
-        sessionMap.put(sessionId, cnxn);
-    }
-
-    @Override
-    public boolean closeSession(long sessionId) {
-        NIOServerCnxn cnxn = sessionMap.remove(sessionId);
-        if (cnxn != null) {
-            cnxn.close();
-            return true;
-        }
-        return false;
     }
 
     @Override

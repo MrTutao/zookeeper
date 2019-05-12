@@ -37,10 +37,13 @@ import org.apache.zookeeper.server.ServerStats;
 import org.apache.zookeeper.server.ZKDatabase;
 import org.apache.zookeeper.server.ZooKeeperServer;
 import org.apache.zookeeper.server.ZooTrace;
+import org.apache.zookeeper.server.quorum.Follower;
+import org.apache.zookeeper.server.quorum.FollowerZooKeeperServer;
 import org.apache.zookeeper.server.quorum.Leader;
 import org.apache.zookeeper.server.quorum.LeaderZooKeeperServer;
 import org.apache.zookeeper.server.quorum.QuorumPeer;
 import org.apache.zookeeper.server.quorum.QuorumZooKeeperServer;
+import org.apache.zookeeper.server.quorum.ObserverZooKeeperServer;
 import org.apache.zookeeper.server.quorum.ReadOnlyZooKeeperServer;
 import org.apache.zookeeper.server.util.OSMXBean;
 import org.slf4j.Logger;
@@ -217,7 +220,7 @@ public class Commands {
      * Information on session expirations and ephemerals. Returned map contains:
      *   - "expiry_time_to_session_ids": Map<Long, Set<Long>>
      *                                   time -> sessions IDs of sessions that expire at time
-     *   - "sesssion_id_to_ephemeral_paths": Map<Long, Set<String>>
+     *   - "session_id_to_ephemeral_paths": Map<Long, Set<String>>
      *                                       session ID -> ephemeral paths created by that session
      * @see ZooKeeperServer#getSessionExpiryMap()
      * @see ZooKeeperServer#getEphemerals()
@@ -306,7 +309,7 @@ public class Commands {
      *   - "ephemerals_count": Integer
      *   - "approximate_data_size": Long
      *   - "open_file_descriptor_count": Long (unix only)
-     *   - "max_file_descritpor_count": Long (unix only)
+     *   - "max_file_descriptor_count": Long (unix only)
      *   - "fsync_threshold_exceed_count": Long
      *   - "followers": Integer (leader only)
      *   - "synced_followers": Integer (leader only)
@@ -351,6 +354,7 @@ public class Commands {
             OSMXBean osMbean = new OSMXBean();
             response.put("open_file_descriptor_count", osMbean.getOpenFileDescriptorCount());
             response.put("max_file_descriptor_count", osMbean.getMaxFileDescriptorCount());
+            response.put("connection_drop_probability", zkServer.getConnectionDropChance());
 
             response.put("last_client_response_size", stats.getClientResponseStats().getLastBufferSize());
             response.put("max_client_response_size", stats.getClientResponseStats().getMaxBufferSize());
@@ -366,6 +370,7 @@ public class Commands {
 
                 response.put("learners", leader.getLearners().size());
                 response.put("synced_followers", leader.getForwardingFollowers().size());
+                response.put("synced_non_voting_followers", leader.getNonVotingFollowers().size());
                 response.put("synced_observers", leader.getObservingLearners().size());
                 response.put("pending_syncs", leader.getNumPendingSyncs());
                 response.put("leader_uptime", leader.getUptime());
@@ -375,8 +380,24 @@ public class Commands {
                 response.put("min_proposal_size", leader.getProposalStats().getMinBufferSize());
             }
 
-            response.putAll(ServerMetrics.getAllValues());
+            if (zkServer instanceof FollowerZooKeeperServer) {
+                Follower follower = ((FollowerZooKeeperServer) zkServer).getFollower();
+                Integer syncedObservers = follower.getSyncedObserverSize();
+                if (syncedObservers != null) {
+                    response.put("synced_observers", syncedObservers);
+                }
+            }
 
+            if (zkServer instanceof ObserverZooKeeperServer) {
+                response.put("observer_master_id", ((ObserverZooKeeperServer)zkServer).getObserver().getLearnerMasterId());
+            }
+
+            ServerMetrics.getMetrics()
+                    .getMetricsProvider()
+                    .dump(
+                    (metric, value) -> {
+                        response.put(metric, value);
+                    });
             return response;
 
         }}
