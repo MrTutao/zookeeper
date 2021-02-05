@@ -46,6 +46,7 @@ import org.apache.zookeeper.common.PathUtils;
 import org.apache.zookeeper.common.StringUtils;
 import org.apache.zookeeper.metrics.impl.DefaultMetricsProvider;
 import org.apache.zookeeper.server.ZooKeeperServer;
+import org.apache.zookeeper.server.auth.ProviderRegistry;
 import org.apache.zookeeper.server.quorum.QuorumPeer.LearnerType;
 import org.apache.zookeeper.server.quorum.QuorumPeer.QuorumServer;
 import org.apache.zookeeper.server.quorum.auth.QuorumAuth;
@@ -179,12 +180,9 @@ public class QuorumPeerConfig {
                 .build()).create(path);
 
             Properties cfg = new Properties();
-            FileInputStream in = new FileInputStream(configFile);
-            try {
+            try (FileInputStream in = new FileInputStream(configFile)) {
                 cfg.load(in);
                 configFileStr = path;
-            } finally {
-                in.close();
             }
 
             /* Read entire config file as initial configuration */
@@ -200,8 +198,7 @@ public class QuorumPeerConfig {
         if (dynamicConfigFileStr != null) {
             try {
                 Properties dynamicCfg = new Properties();
-                FileInputStream inConfig = new FileInputStream(dynamicConfigFileStr);
-                try {
+                try (FileInputStream inConfig = new FileInputStream(dynamicConfigFileStr)) {
                     dynamicCfg.load(inConfig);
                     if (dynamicCfg.getProperty("version") != null) {
                         throw new ConfigException("dynamic file shouldn't have version inside");
@@ -213,8 +210,6 @@ public class QuorumPeerConfig {
                     if (version != null) {
                         dynamicCfg.setProperty("version", version);
                     }
-                } finally {
-                    inConfig.close();
                 }
                 setupQuorumPeerConfig(dynamicCfg, false);
 
@@ -227,11 +222,8 @@ public class QuorumPeerConfig {
             if (nextDynamicConfigFile.exists()) {
                 try {
                     Properties dynamicConfigNextCfg = new Properties();
-                    FileInputStream inConfigNext = new FileInputStream(nextDynamicConfigFile);
-                    try {
+                    try (FileInputStream inConfigNext = new FileInputStream(nextDynamicConfigFile)) {
                         dynamicConfigNextCfg.load(inConfigNext);
-                    } finally {
-                        inConfigNext.close();
                     }
                     boolean isHierarchical = false;
                     for (Entry<Object, Object> entry : dynamicConfigNextCfg.entrySet()) {
@@ -505,11 +497,12 @@ public class QuorumPeerConfig {
      */
     public static void configureSSLAuth() throws ConfigException {
         try (ClientX509Util clientX509Util = new ClientX509Util()) {
-            String sslAuthProp = "zookeeper.authProvider."
+            String sslAuthProp = ProviderRegistry.AUTHPROVIDER_PROPERTY_PREFIX
                                  + System.getProperty(clientX509Util.getSslAuthProviderProperty(), "x509");
             if (System.getProperty(sslAuthProp) == null) {
-                if ("zookeeper.authProvider.x509".equals(sslAuthProp)) {
-                    System.setProperty("zookeeper.authProvider.x509", "org.apache.zookeeper.server.auth.X509AuthenticationProvider");
+                if ((ProviderRegistry.AUTHPROVIDER_PROPERTY_PREFIX + "x509").equals(sslAuthProp)) {
+                    System.setProperty(ProviderRegistry.AUTHPROVIDER_PROPERTY_PREFIX + "x509",
+                        "org.apache.zookeeper.server.auth.X509AuthenticationProvider");
                 } else {
                     throw new ConfigException("No auth provider configured for the SSL authentication scheme '"
                                               + System.getProperty(clientX509Util.getSslAuthProviderProperty())
@@ -527,17 +520,11 @@ public class QuorumPeerConfig {
         new AtomicFileWritingIdiom(new File(configFileStr + ".bak"), new OutputStreamStatement() {
             @Override
             public void write(OutputStream output) throws IOException {
-                InputStream input = null;
-                try {
-                    input = new FileInputStream(new File(configFileStr));
+                try (InputStream input = new FileInputStream(new File(configFileStr))) {
                     byte[] buf = new byte[1024];
                     int bytesRead;
                     while ((bytesRead = input.read(buf)) > 0) {
                         output.write(buf, 0, bytesRead);
-                    }
-                } finally {
-                    if (input != null) {
-                        input.close();
                     }
                 }
             }
@@ -595,11 +582,8 @@ public class QuorumPeerConfig {
             .build()).create(dynamicFileStr);
 
         final Properties cfg = new Properties();
-        FileInputStream in = new FileInputStream(configFile);
-        try {
+        try (FileInputStream in = new FileInputStream(configFile)) {
             cfg.load(in);
-        } finally {
-            in.close();
         }
 
         new AtomicFileWritingIdiom(new File(configFileStr), new WriterStatement() {
@@ -710,7 +694,7 @@ public class QuorumPeerConfig {
                 if (numParticipators <= 2) {
                     LOG.warn("No server failure will be tolerated. You need at least 3 servers.");
                 } else if (numParticipators % 2 == 0) {
-                    LOG.warn("Non-optimial configuration, consider an odd number of servers.");
+                    LOG.warn("Non-optimal configuration, consider an odd number of servers.");
                 }
             }
 

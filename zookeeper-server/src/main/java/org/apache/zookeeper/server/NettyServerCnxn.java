@@ -18,6 +18,7 @@
 
 package org.apache.zookeeper.server;
 
+import static java.nio.charset.StandardCharsets.UTF_8;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufUtil;
 import io.netty.buffer.CompositeByteBuf;
@@ -115,6 +116,9 @@ public class NettyServerCnxn extends ServerCnxn {
         // if this is not in cnxns then it's already closed
         if (!factory.cnxns.remove(this)) {
             LOG.debug("cnxns size:{}", factory.cnxns.size());
+            if (channel.isOpen()) {
+                channel.close();
+            }
             return;
         }
 
@@ -230,7 +234,7 @@ public class NettyServerCnxn extends ServerCnxn {
          */
         private void checkFlush(boolean force) {
             if ((force && sb.length() > 0) || sb.length() > 2048) {
-                sendBuffer(ByteBuffer.wrap(sb.toString().getBytes()));
+                sendBuffer(ByteBuffer.wrap(sb.toString().getBytes(UTF_8)));
                 // clear our internal buffer
                 sb.setLength(0);
             }
